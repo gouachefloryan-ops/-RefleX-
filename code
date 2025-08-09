@@ -1,0 +1,550 @@
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import Image from "next/image";
+import { getPersonalizedEncouragement } from "@/ai/flows/personalized-encouragement";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { LightningBoltIcon } from "@/components/icons";
+import { cn } from "@/lib/utils";
+import { Skeleton } from "@/components/ui/skeleton";
+import { PlayIcon, PauseIcon } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { useToast } from "@/hooks/use-toast";
+import { Leaderboard } from "./leaderboard";
+
+type GameState = "idle" | "waiting" | "ready" | "finished" | "error";
+
+export type Score = {
+  pseudo: string;
+  time: number;
+  date: number;
+};
+
+type Stats = {
+  bestTime: number | null;
+  gamesPlayed: number;
+  allTimes: number[];
+  scores: Score[]; // already sorted ascending by time
+};
+
+export function ReactionGame() {
+  // game state
+  const [gameState, setGameState] = useState<GameState>("idle");
+  const [stats, setStats] = useState<Stats>({
+    bestTime: null,
+    gamesPlayed: 0,
+    allTimes: [],
+    scores: []
+  });
+  const [lastReactionTime, setLastReactionTime] = useState<number>(0);
+  const [encouragement, setEncouragement] = useState<string>("");
+  const [isLoadingAI, setIsLoadingAI] = useState<boolean>(false);
+
+  // user / pseudo
+  const [pseudo, setPseudo] = useState<string>("");
+  const [isPseudoModalOpen, setIsPseudoModalOpen] = useState(false);
+  const [inputPseudo, setInputPseudo] = useState("");
+
+  // music & beep
+  const [isPlaying, setIsPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+
+  // mode (visual | audio)
+  const [mode, setMode] = useState<"visual" | "audio" | null>(null);
+  const [isModeModalOpen, setIsModeModalOpen] = useState(true);
+
+  // responsive circle size (px)
+  const [circleSize, setCircleSize] = useState<number>(() => Math.min(typeof window !== "undefined" ? window.innerWidth * 0.6 : 224, 280));
+
+  // refs
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startTimeRef = useRef<number>(0);
+  const lastClickRef = useRef<number>(0); // anti-spam
+  const gameStateRef = useRef<GameState>(gameState);
+
+  // hooks
+  const { toast } = useToast();
+
+  // keep ref synced
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
+
+  // INITIAL LOAD: pseudo + stats + audio setup
+  useEffect(() => {
+    // circle size on resize
+    const handleResize = () => {
+      const size = Math.min(window.innerWidth * 0.6, 280);
+      setCircleSize(size);
+    };
+    handleResize();
+    window.addEventListener("resize", handleResize);
+
+    // load pseudo & stats safely
+    try {
+      const storedPseudo = localStorage.getItem("pseudo");
+      if (storedPseudo) {
+        setPseudo(storedPseudo);
+      } else {
+        setIsPseudoModalOpen(true);
+      }
+
+      const storedBestTime = localStorage.getItem("bestTime");
+      const storedGamesPlayed = localStorage.getItem("gamesPlayed");
+      const storedAllTimes = localStorage.getItem("allTimes");
+      const storedScores = localStorage.getItem("scores");
+
+      setStats({
+        bestTime: storedBestTime ? parseInt(storedBestTime, 10) : null,
+        gamesPlayed: storedGamesPlayed ? parseInt(storedGamesPlayed, 10) : 0,
+        allTimes: storedAllTimes ? JSON.parse(storedAllTimes) : [],
+        scores: storedScores ? JSON.parse(storedScores) : [],
+      });
+    } catch (e) {
+      console.error("Erreur lors du chargement des données locales:", e);
+      // clear corrupted items
+      try {
+        localStorage.removeItem("allTimes");
+        localStorage.removeItem("scores");
+      } catch {}
+      setStats({
+        bestTime: null,
+        gamesPlayed: 0,
+        allTimes: [],
+        scores: []
+      });
+    }
+
+    // background loop music
+    if (typeof window !== "undefined") {
+      audioRef.current = new Audio('https://storage.googleapis.com/test-assets-9786/arcade-music.mp3');
+      audioRef.current.loop = true;
+      audioRef.current.preload = "auto";
+    }
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    };
+  }, []);
+
+  // --- helper: safe localStorage writer
+  const safeSetLocal = (key: string, value: string) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch (e) {
+      console.error("localStorage set failed:", e);
+    }
+  };
+
+  // Fetch encouragement (AI) - keep as before
+  const fetchEncouragement = useCallback(async (times: number[]) => {
+    if (times.length === 0) return;
+    setIsLoadingAI(true);
+    setEncouragement("");
+    try {
+      const result = await getPersonalizedEncouragement({ reactionTimes: times.slice(-10) });
+      setEncouragement(result.encouragementMessage);
+    } catch (error) {
+      console.error("Error fetching encouragement:", error);
+      setEncouragement("Keep practicing to improve your score!");
+    } finally {
+      setIsLoadingAI(false);
+    }
+  }, []);
+
+  // play beep using WebAudio API
+  const playBeep = useCallback(() => {
+    if (!audioContextRef.current) {
+        console.error("AudioContext is not initialized.");
+        return;
+    }
+    try {
+      const ctx = audioContextRef.current;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.value = 880; // beep frequency
+      g.gain.value = 0.001; // start very low to avoid clicks
+      o.connect(g);
+      g.connect(ctx.destination);
+      // ramp quickly
+      g.gain.linearRampToValueAtTime(0.15, ctx.currentTime + 0.005);
+      o.start();
+      // stop after 120ms
+      setTimeout(() => {
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.02);
+        o.stop(ctx.currentTime + 0.03);
+      }, 120);
+    } catch (e) {
+      console.error("WebAudio error:", e);
+    }
+  }, []);
+
+  // update stats, keep only top10 scores
+  const updateStats = useCallback((newTime: number) => {
+    setStats((prev) => {
+      const newGamesPlayed = prev.gamesPlayed + 1;
+      const newBestTime = prev.bestTime ? Math.min(prev.bestTime, newTime) : newTime;
+      const newAllTimes = [...prev.allTimes, newTime];
+
+      const newScore: Score = { pseudo, time: newTime, date: Date.now() };
+      const newScores = [...prev.scores, newScore].sort((a,b) => a.time - b.time).slice(0, 10); // top 10
+
+      // save safely
+      try {
+        safeSetLocal("bestTime", String(newBestTime));
+        safeSetLocal("gamesPlayed", String(newGamesPlayed));
+        safeSetLocal("allTimes", JSON.stringify(newAllTimes));
+        safeSetLocal("scores", JSON.stringify(newScores));
+      } catch (e) {
+        console.error("saving stats failed:", e);
+      }
+
+      fetchEncouragement(newAllTimes);
+
+      return {
+        bestTime: newBestTime,
+        gamesPlayed: newGamesPlayed,
+        allTimes: newAllTimes,
+        scores: newScores,
+      };
+    });
+  }, [pseudo, fetchEncouragement]);
+
+  // start game: choose random delay then trigger ready (and beep if audio mode)
+  const startGame = useCallback(() => {
+    if (!pseudo) {
+      setIsPseudoModalOpen(true);
+      return;
+    }
+
+    // NEW: Initialize AudioContext on first user interaction
+    if (audioContextRef.current === null) {
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      audioContextRef.current = new AudioContext();
+    }
+    // Resume context if it's suspended
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
+
+    setGameState("waiting");
+    setLastReactionTime(0);
+    setEncouragement("");
+
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+
+    const delay = Math.random() * 2000 + 1000; // 1000-3000ms
+    timeoutRef.current = setTimeout(() => {
+      if (gameStateRef.current !== "waiting") return;
+      startTimeRef.current = Date.now();
+      setGameState("ready");
+      // audio signal for mode 'audio'
+      if (mode === "audio") {
+        playBeep();
+      }
+    }, delay);
+  }, [pseudo, mode, playBeep]);
+
+  // toggle background music
+  const toggleMusic = () => {
+    if (!audioRef.current) return;
+    if (isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      audioRef.current.play().then(() => {
+        setIsPlaying(true);
+      }).catch((e) => {
+        console.error("Audio play failed:", e);
+        toast({ title: "Lecture audio impossible", description: "Le navigateur a bloqué la lecture automatique." });
+      });
+    }
+  };
+
+  // handle circle (or keyboard) interaction
+  const handleCircleClick = useCallback(() => {
+    const now = Date.now();
+    // anti-spam: ignore clicks within 50ms
+    if (now - lastClickRef.current < 50) return;
+    lastClickRef.current = now;
+
+    if (gameState === "waiting") {
+      // clicked too early
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      setGameState("error");
+      setEncouragement("Patience is clé ! Attendez le signal.");
+    } else if (gameState === "ready") {
+      const time = Date.now() - startTimeRef.current;
+      setLastReactionTime(time);
+      updateStats(time);
+      setGameState("finished");
+    } else if (gameState === "idle" || gameState === "finished" || gameState === "error") {
+      // ignore direct clicks; prefer pressing the start button
+    }
+  }, [gameState, updateStats]);
+
+  // keyboard support
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code === "Space" || e.code === "Enter") {
+        e.preventDefault();
+        handleCircleClick();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handleCircleClick]);
+
+  // compute instruction text
+  const getInstructionText = () => {
+    switch (gameState) {
+      case "idle": return mode === "audio" ? "Choisissez 'Commencer' puis attendez le bip sonore." : "Cliquez sur le cercle dès qu'il devient vert !";
+      case "waiting": return mode === "audio" ? "Attendez le bip..." : "Attendez que le cercle devienne vert...";
+      case "ready": return "CLIQUEZ MAINTENANT !";
+      case "error": return "Vous avez cliqué avant le signal !";
+      case "finished":
+        if (lastReactionTime < 200) return "🔥 INCROYABLE ! Réflexes de ninja !";
+        if (lastReactionTime < 250) return "⚡ EXCELLENT ! Super rapide !";
+        if (lastReactionTime < 300) return "👍 BIEN JOUÉ ! Bon temps !";
+        if (lastReactionTime < 400) return "👌 Pas mal ! Vous pouvez faire mieux !";
+        return "🎯 Continuez ! L'entraînement paie !";
+      default: return "";
+    }
+  };
+
+  // average
+  const getAverageTime = () => {
+    if (stats.allTimes.length === 0) return null;
+    const sum = stats.allTimes.reduce((a, b) => a + b, 0);
+    return Math.round(sum / stats.allTimes.length);
+  };
+
+  // render Start/Rejouer button
+  const renderButton = () => {
+    if (gameState === 'idle' || gameState === 'finished' || gameState === 'error') {
+      return (
+        <Button
+          onClick={() => {
+            // ensure mode chosen
+            if (!mode) {
+              setIsModeModalOpen(true);
+              return;
+            }
+            startGame();
+          }}
+          size="lg"
+          className="font-headline uppercase tracking-widest text-lg rounded-full px-12 py-7 bg-gradient-to-r from-primary to-accent hover:scale-105 transition-transform duration-300 shadow-lg shadow-primary/20 hover:shadow-primary/40 border-2 border-white/10"
+        >
+          {gameState === 'idle' ? 'Commencer' : 'Rejouer'}
+        </Button>
+      );
+    }
+    return null;
+  };
+
+  // compute circle data-state for styling
+  const circleState = gameState === 'error' ? 'error' : (gameState === 'finished' ? 'clicked' : (gameState === 'ready' ? 'ready' : gameState));
+
+  // get current user's rank if in leaderboard
+  const currentUserRank = (() => {
+    if (!pseudo || stats.scores.length === 0) return null;
+    const idx = stats.scores.findIndex(s => s.pseudo === pseudo);
+    return idx >= 0 ? idx + 1 : null;
+  })();
+
+  return (
+    <div className="flex flex-col items-center justify-center text-center gap-8 w-full max-w-4xl mx-auto p-4">
+      {/* Mode selector modal */}
+      <Dialog open={isModeModalOpen} onOpenChange={setIsModeModalOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Choisissez un mode</DialogTitle>
+            <DialogDescription>
+              Mode visuel : signal visuel (cercle vert).<br />
+              Mode sonore : bip au signal (utile si vous jouez les yeux ailleurs).
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex gap-4 justify-center mt-4">
+            <Button onClick={() => { setMode("visual"); setIsModeModalOpen(false); }} variant="ghost">Mode Visuel</Button>
+            <Button onClick={() => { setMode("audio"); setIsModeModalOpen(false); }} variant="ghost">Mode Sonore</Button>
+          </div>
+
+          <DialogFooter>
+            <Button onClick={() => { setMode("visual"); setIsModeModalOpen(false); }}>Je veux les deux plus tard</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Pseudo modal */}
+      <Dialog open={isPseudoModalOpen} onOpenChange={setIsPseudoModalOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Bienvenue, Titan du Réflexe !</DialogTitle>
+            <DialogDescription>
+              Choisis un pseudonyme (≥ 3 caractères) pour apparaître dans le classement.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            placeholder="Votre pseudo..."
+            value={inputPseudo}
+            onChange={(e) => setInputPseudo(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && (() => {
+              if (inputPseudo.trim().length < 3) {
+                toast({
+                  title: "Pseudo invalide",
+                  description: "Votre pseudo doit contenir au moins 3 caractères.",
+                  variant: "destructive"
+                });
+                return;
+              }
+              safeSetLocal("pseudo", inputPseudo.trim());
+              setPseudo(inputPseudo.trim());
+              setIsPseudoModalOpen(false);
+              toast({
+                title: "Bienvenue !",
+                description: `Votre pseudo ${inputPseudo.trim()} a été enregistré.`
+              });
+            })()}
+          />
+          <DialogFooter>
+            <Button onClick={() => {
+              if (inputPseudo.trim().length < 3) {
+                toast({
+                  title: "Pseudo invalide",
+                  description: "Votre pseudo doit contenir au moins 3 caractères.",
+                  variant: "destructive"
+                });
+                return;
+              }
+              safeSetLocal("pseudo", inputPseudo.trim());
+              setPseudo(inputPseudo.trim());
+              setIsPseudoModalOpen(false);
+              toast({
+                title: "Bienvenue !",
+                description: `Votre pseudo ${inputPseudo.trim()} a été enregistré.`
+              });
+            }}>Enregistrer</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Top controls */}
+      <div className="absolute top-4 right-4 flex items-center gap-2">
+        {pseudo && <span className="text-white font-bold hidden sm:inline">Salut, {pseudo}</span>}
+        <Button onClick={toggleMusic} variant="ghost" size="icon" aria-label="toggle background music">
+          {isPlaying ? <PauseIcon className="h-6 w-6 text-white" /> : <PlayIcon className="h-6 w-6 text-white" />}
+        </Button>
+      </div>
+
+      <h1 className="font-headline text-5xl md:text-6xl font-black uppercase tracking-wider text-primary text-shadow-primary animate-title-pulse flex items-center gap-3">
+        <LightningBoltIcon className="text-4xl" />
+        Reflex
+        <LightningBoltIcon className="text-4xl" />
+      </h1>
+
+      {/* big result / time */}
+      <div className="h-20 flex items-center justify-center">
+        <p className="text-5xl md:text-6xl font-bold font-headline text-primary transition-all duration-300"
+           style={{ opacity: gameState === 'finished' || gameState === 'error' ? 1 : 0}}>
+          {gameState === 'finished' && `${lastReactionTime} ms`}
+          {gameState === 'error' && `Trop tôt !`}
+        </p>
+      </div>
+
+      {/* instruction */}
+      <p className="text-lg md:text-xl text-white/80 min-h-[2.5rem]">{getInstructionText()}</p>
+
+      {/* reaction circle */}
+      <div
+        role="button"
+        aria-label="Reaction circle"
+        tabIndex={0}
+        onClick={handleCircleClick}
+        onKeyDown={(e) => {
+          if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            handleCircleClick();
+          }
+        }}
+        className={cn(
+          "rounded-full cursor-pointer transition-all duration-300 ease-in-out border-4 border-white/15 flex items-center justify-center user-select-none",
+          "data-[state=idle]:bg-red-600 data-[state=idle]:animate-red-pulse",
+          "data-[state=waiting]:bg-red-600 data-[state=waiting]:animate-red-pulse",
+          "data-[state=ready]:bg-green-500 data-[state=ready]:animate-green-pulse",
+          "data-[state=error]:bg-orange-500 data-[state=error]:animate-error-shake",
+          "data-[state=clicked]:bg-primary data-[state=clicked]:scale-95",
+        )}
+        data-state={circleState}
+        style={{ width: circleSize, height: circleSize, minWidth: 84, minHeight: 84 }}
+      >
+        {/* optionally show small hint inside circle */}
+        <span className="text-white/90 select-none font-bold">
+          {gameState === "idle" && "Prêt"}
+          {gameState === "waiting" && "Attendez"}
+          {gameState === "ready" && "GO"}
+          {gameState === "error" && "Trop tôt"}
+          {gameState === "finished" && `${lastReactionTime} ms`}
+        </span>
+      </div>
+
+      {/* button */}
+      <div className="h-20 flex items-center justify-center">
+        {renderButton()}
+      </div>
+
+      {/* AI encouragement */}
+      <div className="text-base text-white/60 min-h-[2rem] max-w-md" aria-live="polite">
+        {isLoadingAI ? <Skeleton className="h-4 w-3/4 mx-auto" /> : encouragement}
+      </div>
+
+      {/* stats + leaderboard */}
+      <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-8 mt-8">
+        <Card className="w-full bg-black/30 border-primary/30 backdrop-blur-sm">
+          <CardHeader>
+            <CardTitle className="text-primary font-headline text-2xl tracking-wider">Statistiques</CardTitle>
+          </CardHeader>
+          <CardContent className="grid grid-cols-3 gap-4 text-center text-lg">
+            <div>
+              <p className="text-sm text-white/60 uppercase tracking-widest">Meilleur</p>
+              <p className="font-bold font-headline text-2xl">{stats.bestTime ? `${stats.bestTime} ms` : '--'}</p>
+            </div>
+            <div>
+              <p className="text-sm text-white/60 uppercase tracking-widest">Jouées</p>
+              <p className="font-bold font-headline text-2xl">{stats.gamesPlayed}</p>
+            </div>
+            <div>
+              <p className="text-sm text-white/60 uppercase tracking-widest">Moyenne</p>
+              <p className="font-bold font-headline text-2xl">{getAverageTime() ? `${getAverageTime()} ms` : '--'}</p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Leaderboard component expects scores prop and highlight of current user */}
+        <Leaderboard scores={stats.scores} currentUserPseudo={pseudo} highlightRank={currentUserRank} />
+      </div>
+
+      {/* ad / footer card */}
+      <div className="w-full mt-8">
+        <Card className="w-full bg-black/30 border-dashed border-white/20 backdrop-blur-sm">
+          <CardContent className="p-4 flex flex-col items-center justify-center text-center gap-2">
+            <p className="text-sm text-white/40">Publicité</p>
+            <Image
+              src="https://placehold.co/728x90.png"
+              alt="Ad placeholder"
+              width={728}
+              height={90}
+              className="rounded-md"
+              data-ai-hint="advertisement banner"
+            />
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
