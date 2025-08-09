@@ -1,2 +1,2 @@
 # -RefleX-
-Jeu de RefleX et de temps de réaction 
+Jeu de Réflexe et de temps de réaction 
